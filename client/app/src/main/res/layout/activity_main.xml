@@ -1,0 +1,110 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="24dp"
+        android:gravity="center_horizontal">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="ToyVPN Client"
+            android:textSize="24sp"
+            android:textStyle="bold"
+            android:layout_marginBottom="32dp"/>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Server Address (IP)"
+            android:layout_marginBottom="16dp">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/etServerAddress"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="10.0.0.1"
+                android:inputType="numberDecimal|text" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Server Port"
+            android:layout_marginBottom="16dp">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/etServerPort"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="12345"
+                android:inputType="number" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <com.google.android.material.textfield.TextInputLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:hint="Local Client IP"
+            android:layout_marginBottom="24dp">
+
+            <com.google.android.material.textfield.TextInputEditText
+                android:id="@+id/etClientIp"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="10.0.0.2"
+                android:inputType="numberDecimal|text" />
+        </com.google.android.material.textfield.TextInputLayout>
+
+        <Button
+            android:id="@+id/btnConnect"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/connect"
+            android:layout_marginBottom="24dp"/>
+
+        <LinearLayout
+            android:id="@+id/layoutStats"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Network Statistics"
+                android:textStyle="bold"
+                android:textSize="18sp"
+                android:layout_marginBottom="8dp"/>
+
+            <TextView
+                android:id="@+id/tvDuration"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Duration: 0s"
+                android:layout_marginBottom="4dp"/>
+
+             <TextView
+                android:id="@+id/tvTx"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Sent: 0 B (0 B/s)"
+                android:layout_marginBottom="4dp"/>
+
+             <TextView
+                android:id="@+id/tvRx"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Recv: 0 B (0 B/s)"
+                android:layout_marginBottom="4dp"/>
+
+        </LinearLayout>
+
+    </LinearLayout>
+</ScrollView>

@@ -1,0 +1,8 @@
+<resources>
+    <string name="app_name">ToyVPN</string>
+    <string name="server_address">Server Address</string>
+    <string name="connect">Connect</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="status_disconnected">Disconnected</string>
+    <string name="status_connected">Connected</string>
+</resources>

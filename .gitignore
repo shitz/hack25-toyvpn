@@ -1,0 +1,18 @@
+# General
+.DS_Store
+
+# Rust (Server)
+server/target/
+**/*.rs.bk
+
+# Android (Client)
+client/.gradle/
+client/build/
+client/app/build/
+client/local.properties
+client/.idea/
+client/*.iml
+*.iml
+.idea/
+.gradle/
+build/
