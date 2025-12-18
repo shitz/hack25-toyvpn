@@ -2,6 +2,16 @@ namespace toyvpn_client {
 
 };
 
+dictionary Route {
+    string destination;
+    i32 prefix_length;
+};
+
+dictionary ClientConfig {
+    string client_ip;
+    sequence<Route> routes;
+};
+
 callback interface VpnCallback {
     void on_stats_update(u64 tx_bytes, u64 rx_bytes);
     void on_stop(string reason);
@@ -15,6 +25,8 @@ enum VpnError {
 interface ToyVpnClient {
     constructor();
     [Throws=VpnError]
-    void start(i32 tun_fd, i32 udp_fd, VpnCallback callback);
+    ClientConfig handshake(i32 udp_fd);
+    [Throws=VpnError]
+    void start(i32 tun_fd, VpnCallback callback);
     void stop();
 };
