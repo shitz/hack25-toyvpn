@@ -12,7 +12,11 @@ client/app/build/
 client/local.properties
 client/.idea/
 client/*.iml
+client/app/src/main/jniLibs/
 *.iml
 .idea/
 .gradle/
 build/
+
+# Rust (Client)
+client/rust/target/
