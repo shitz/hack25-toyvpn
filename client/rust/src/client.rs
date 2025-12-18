@@ -1,9 +1,11 @@
 use std::os::fd::FromRawFd;
 use std::net::UdpSocket as StdUdpSocket;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::io::{Read, Write};
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::Notify;
+use tokio::io::unix::AsyncFd;
 use crate::VpnCallback;
 
 const BUFFER_SIZE: usize = 4096;
@@ -16,143 +18,175 @@ pub async fn run_vpn(
 ) -> anyhow::Result<()> {
     log::info!("run_vpn starting with tun_fd={}", tun_fd);
 
-    // 1. Create TUN file handles (we'll use two separate handles for read/write threads)
-    // Safety: We own this FD from Android. We dup it so we can have separate read/write handles.
-    let tun_read_fd = unsafe { libc::dup(tun_fd) };
-    let tun_write_fd = unsafe { libc::dup(tun_fd) };
+    // 1. Prepare TUN device
+    // Set to non-blocking mode for AsyncFd
+    set_nonblocking(tun_fd)?;
 
-    if tun_read_fd < 0 || tun_write_fd < 0 {
-        anyhow::bail!("Failed to dup TUN fd");
-    }
+    // Create File from raw fd. unsafe because we assume ownership of fd.
+    // We wrap it in AsyncFd to use with tokio
+    let tun_file = unsafe { std::fs::File::from_raw_fd(tun_fd) };
+    let tun = Arc::new(AsyncFd::new(tun_file)?);
 
-    // Close the original fd since we've duped it
-    unsafe { libc::close(tun_fd) };
-
-    // Ensure the fds are in BLOCKING mode for our thread-based I/O
-    set_blocking(tun_read_fd)?;
-    set_blocking(tun_write_fd)?;
-
-    let mut tun_reader = unsafe { std::fs::File::from_raw_fd(tun_read_fd) };
-    let mut tun_writer = unsafe { std::fs::File::from_raw_fd(tun_write_fd) };
-
-    // 2. Use the pre-connected, protected UDP socket from Android
+    // 2. Prepare UDP socket
+    // Use the pre-connected, protected UDP socket from Android
     std_udp.set_nonblocking(true)?;
     let udp = Arc::new(UdpSocket::from_std(std_udp)?);
 
     log::info!("Using pre-connected UDP socket from Android");
 
-    // 3. Create channels for communication between threads
-    // TUN Read Thread -> Main Loop: packets to send via UDP
-    let (tun_tx, mut tun_rx) = mpsc::channel::<Vec<u8>>(256);
-    // Main Loop -> TUN Write Thread: packets received from UDP
-    let (udp_tx, mut udp_rx) = mpsc::channel::<Vec<u8>>(256);
+    // 3. Stats
+    let total_tx = Arc::new(AtomicU64::new(0));
+    let total_rx = Arc::new(AtomicU64::new(0));
 
-    // 4. Spawn TUN Read Thread (blocking read)
-    let _tun_read_handle = std::thread::spawn(move || {
-        log::info!("TUN read thread started");
+    // 4. Spawn Tasks
+
+    // Task: TUN -> UDP (Uplink)
+    let tun_reader = tun.clone();
+    let udp_sender = udp.clone();
+    let tx_stats = total_tx.clone();
+    let stop_tx = stop_signal.clone();
+
+    let tx_task = tokio::spawn(async move {
+        log::info!("Tx task started");
         let mut buf = [0u8; BUFFER_SIZE];
         loop {
-            match tun_reader.read(&mut buf) {
-                Ok(0) => {
-                    log::info!("TUN read: EOF");
-                    break;
-                }
-                Ok(n) => {
-                    if tun_tx.blocking_send(buf[..n].to_vec()).is_err() {
-                        log::info!("TUN read: channel closed");
-                        break;
-                    }
-                }
-                Err(e) => {
-                    log::error!("TUN read error: {}", e);
-                    break;
-                }
-            }
-        }
-        log::info!("TUN read thread exiting");
-    });
-
-    // 5. Spawn TUN Write Thread (blocking write)
-    let _tun_write_handle = std::thread::spawn(move || {
-        log::info!("TUN write thread started");
-        while let Some(packet) = udp_rx.blocking_recv() {
-            if let Err(e) = tun_writer.write_all(&packet) {
-                log::error!("TUN write error: {}", e);
-                break;
-            }
-        }
-        log::info!("TUN write thread exiting");
-    });
-
-    // 6. Async main loop: handles UDP and stats
-    let mut total_tx = 0u64;
-    let mut total_rx = 0u64;
-    let mut stats_interval = tokio::time::interval(std::time::Duration::from_secs(1));
-    let mut buf_udp = [0u8; BUFFER_SIZE];
-
-    let udp_recv = udp.clone();
-
-    loop {
-        tokio::select! {
-            biased; // Check stop signal first
-
-            _ = stop_signal.notified() => {
-                log::info!("Stop signal received in main loop");
-                break;
-            }
-
-            _ = stats_interval.tick() => {
-                callback.on_stats_update(total_tx, total_rx);
-            }
-
-            // Receive from TUN read thread -> Send to UDP
-            Some(packet) = tun_rx.recv() => {
-                total_tx += packet.len() as u64;
-                if let Err(e) = udp.send(&packet).await {
-                    log::error!("UDP send error: {}", e);
-                }
-            }
-
-            // Receive from UDP -> Send to TUN write thread
-            result = udp_recv.recv(&mut buf_udp) => {
-                match result {
-                    Ok(n) => {
-                        total_rx += n as u64;
-                        if udp_tx.send(buf_udp[..n].to_vec()).await.is_err() {
-                            log::info!("TUN write channel closed");
+            tokio::select! {
+                _ = stop_tx.notified() => break,
+                guard = tun_reader.readable() => {
+                    match guard {
+                        Ok(mut guard) => {
+                            match guard.try_io(|inner| inner.get_ref().read(&mut buf)) {
+                                Ok(Ok(n)) => {
+                                    if n == 0 {
+                                        log::info!("TUN read EOF");
+                                        break;
+                                    }
+                                    tx_stats.fetch_add(n as u64, Ordering::Relaxed);
+                                    if let Err(e) = udp_sender.send(&buf[..n]).await {
+                                        log::error!("UDP send error: {}", e);
+                                    }
+                                }
+                                Ok(Err(e)) => {
+                                    log::error!("TUN read error: {}", e);
+                                    break;
+                                }
+                                Err(_would_block) => continue,
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("TUN readable error: {}", e);
                             break;
                         }
                     }
-                    Err(e) => {
-                        log::error!("UDP recv error: {}", e);
+                }
+            }
+        }
+        log::info!("Tx task exiting");
+    });
+
+    // Task: UDP -> TUN (Downlink)
+    let tun_writer = tun.clone();
+    let udp_receiver = udp.clone();
+    let rx_stats = total_rx.clone();
+    let stop_rx = stop_signal.clone();
+
+    let rx_task = tokio::spawn(async move {
+        log::info!("Rx task started");
+        let mut buf = [0u8; BUFFER_SIZE];
+        loop {
+            tokio::select! {
+                _ = stop_rx.notified() => break,
+                res = udp_receiver.recv(&mut buf) => {
+                    match res {
+                        Ok(n) => {
+                            rx_stats.fetch_add(n as u64, Ordering::Relaxed);
+                            // Write to TUN
+                            // We loop until we can write or error
+                            loop {
+                                let mut guard = match tun_writer.writable().await {
+                                    Ok(g) => g,
+                                    Err(e) => {
+                                        log::error!("TUN writable error: {}", e);
+                                        return;
+                                    }
+                                };
+
+                                match guard.try_io(|inner| inner.get_ref().write(&buf[..n])) {
+                                    Ok(Ok(_)) => break,
+                                    Ok(Err(e)) => {
+                                        log::error!("TUN write error: {}", e);
+                                        return;
+                                    }
+                                    Err(_would_block) => continue,
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("UDP recv error: {}", e);
+                            break;
+                        }
                     }
                 }
             }
         }
+        log::info!("Rx task exiting");
+    });
+
+    // Task: Stats
+    let stats_tx = total_tx.clone();
+    let stats_rx = total_rx.clone();
+    let stop_stats = stop_signal.clone();
+    let cb = callback.clone();
+
+    let stats_task = tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tokio::select! {
+                _ = stop_stats.notified() => break,
+                _ = interval.tick() => {
+                    cb.on_stats_update(
+                        stats_tx.load(Ordering::Relaxed),
+                        stats_rx.load(Ordering::Relaxed)
+                    );
+                }
+            }
+        }
+        log::info!("Stats task exiting");
+    });
+
+    // Wait for stop signal or any task failure
+    tokio::select! {
+        _ = stop_signal.notified() => {
+            log::info!("Stop signal received in main loop");
+        }
+        _ = tx_task => {
+            log::info!("Tx task finished unexpectedly");
+        }
+        _ = rx_task => {
+            log::info!("Rx task finished unexpectedly");
+        }
+        _ = stats_task => {
+            log::info!("Stats task finished unexpectedly");
+        }
     }
 
-    log::info!("Main loop exiting, cleaning up...");
-
-    // Cleanup: close channels by dropping senders
-    drop(tun_rx);
-    drop(udp_tx);
+    // Ensure all tasks are cleaned up
+    stop_signal.notify_waiters();
 
     log::info!("VPN run_vpn completed");
     Ok(())
 }
 
-/// Set a file descriptor to blocking mode
-fn set_blocking(fd: i32) -> anyhow::Result<()> {
+fn set_nonblocking(fd: i32) -> anyhow::Result<()> {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL);
         if flags < 0 {
             anyhow::bail!("fcntl F_GETFL failed");
         }
-        // Clear O_NONBLOCK flag
-        if libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) < 0 {
-            anyhow::bail!("fcntl F_SETFL failed to set blocking");
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            anyhow::bail!("fcntl F_SETFL failed to set nonblocking");
         }
     }
-    log::info!("Set fd {} to blocking mode", fd);
+    log::info!("Set fd {} to non-blocking mode", fd);
     Ok(())
 }
