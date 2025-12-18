@@ -1,4 +1,4 @@
-package com.example.toyvpn
+package net.anapaya.toyvpn
 
 import android.content.BroadcastReceiver
 import android.content.Context

@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.example.toyvpn"
+    namespace = "net.anapaya.toyvpn"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.example.toyvpn"
+        applicationId = "net.anapaya.toyvpn"
         minSdk = 24
         targetSdk = 34
         versionCode = 1

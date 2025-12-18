@@ -1,4 +1,4 @@
-package com.example.toyvpn
+package net.anapaya.toyvpn
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -27,9 +27,9 @@ class ToyVpnService : VpnService() {
     private var startTime = 0L
 
     companion object {
-        const val ACTION_CONNECT = "com.example.toyvpn.CONNECT"
-        const val ACTION_DISCONNECT = "com.example.toyvpn.DISCONNECT"
-        const val ACTION_STATS_UPDATE = "com.example.toyvpn.STATS_UPDATE"
+        const val ACTION_CONNECT = "net.anapaya.toyvpn.CONNECT"
+        const val ACTION_DISCONNECT = "net.anapaya.toyvpn.DISCONNECT"
+        const val ACTION_STATS_UPDATE = "net.anapaya.toyvpn.STATS_UPDATE"
 
         const val EXTRA_SERVER_ADDRESS = "server_address"
         const val EXTRA_SERVER_PORT = "server_port"
@@ -92,7 +92,7 @@ class ToyVpnService : VpnService() {
     private suspend fun reportStatsLoop() {
         var lastTx = 0L
         var lastRx = 0L
-        while (isActive) {
+        while (currentCoroutineContext().isActive) {
             delay(1000)
             val now = System.currentTimeMillis()
             val duration = (now - startTime) / 1000
@@ -136,7 +136,7 @@ class ToyVpnService : VpnService() {
         }
     }
 
-    private fun runVpn(serverIp: String, serverPort: Int, clientIp: String) {
+    private suspend fun runVpn(serverIp: String, serverPort: Int, clientIp: String) {
         val builder = Builder()
         builder.setSession("ToyVPN")
         builder.addAddress(clientIp, 24)
