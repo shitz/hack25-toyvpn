@@ -10,11 +10,11 @@ const BUFFER_SIZE: usize = 4096;
 
 pub async fn run_vpn(
     tun_fd: i32,
-    udp_fd: i32,
+    std_udp: StdUdpSocket,
     callback: Arc<dyn VpnCallback>,
     stop_signal: Arc<Notify>,
 ) -> anyhow::Result<()> {
-    log::info!("run_vpn starting with tun_fd={}, udp_fd={}", tun_fd, udp_fd);
+    log::info!("run_vpn starting with tun_fd={}", tun_fd);
 
     // 1. Create TUN file handles (we'll use two separate handles for read/write threads)
     // Safety: We own this FD from Android. We dup it so we can have separate read/write handles.
@@ -36,8 +36,6 @@ pub async fn run_vpn(
     let mut tun_writer = unsafe { std::fs::File::from_raw_fd(tun_write_fd) };
 
     // 2. Use the pre-connected, protected UDP socket from Android
-    // Safety: We own this FD from Android (it's already connected and protected)
-    let std_udp = unsafe { StdUdpSocket::from_raw_fd(udp_fd) };
     std_udp.set_nonblocking(true)?;
     let udp = Arc::new(UdpSocket::from_std(std_udp)?);
 

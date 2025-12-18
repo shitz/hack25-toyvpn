@@ -110,30 +110,7 @@ class ToyVpnService : VpnService() {
     }
 
     private suspend fun runVpn(serverIp: String, serverPort: Int, clientIp: String) {
-        Log.d("ToyVPN", "Setting up VPN interface")
-        val builder = Builder()
-        builder.setSession("ToyVPN")
-        builder.addAddress(clientIp, 24)
-        builder.addRoute("0.0.0.0", 0)
-        builder.setMtu(1500)
-
-        try {
-            interfacePfd = builder.establish()
-        } catch (e: Exception) {
-            Log.e("ToyVPN", "Builder establish failed", e)
-            throw e
-        }
-
-        if (interfacePfd == null) {
-             throw IllegalStateException("Could not establish VPN")
-        }
-
-        // Detach TUN FD to pass ownership to Rust
-        val tunFd = interfacePfd!!.detachFd()
-        Log.d("ToyVPN", "VPN Interface TUN FD: $tunFd")
-        interfacePfd = null
-
-        // Create and PROTECT the UDP socket BEFORE connecting
+        // 1. Create and PROTECT the UDP socket BEFORE connecting
         // Use DatagramChannel which allows us to get the FD via ParcelFileDescriptor
         Log.d("ToyVPN", "Creating and protecting UDP socket...")
         val channel = DatagramChannel.open()
@@ -153,6 +130,47 @@ class ToyVpnService : VpnService() {
         val udpPfd = ParcelFileDescriptor.fromDatagramSocket(socket)
         val udpFd = udpPfd.detachFd()  // Detach to pass ownership to Rust
         Log.d("ToyVPN", "UDP socket FD: $udpFd")
+
+        // 2. Handshake
+        Log.d("ToyVPN", "Performing handshake...")
+        val config = try {
+            vpnClient?.handshake(udpFd)
+        } catch (e: Exception) {
+            Log.e("ToyVPN", "Handshake failed", e)
+            throw e
+        }
+
+        if (config == null) {
+             throw IllegalStateException("Handshake returned null config")
+        }
+        Log.d("ToyVPN", "Handshake successful. IP: ${config.clientIp}")
+
+        // 3. Setup TUN interface
+        Log.d("ToyVPN", "Setting up VPN interface")
+        val builder = Builder()
+        builder.setSession("ToyVPN")
+        builder.addAddress(config.clientIp, 24)
+
+        for (route in config.routes) {
+             builder.addRoute(route.destination, route.prefixLength)
+        }
+        builder.setMtu(1500)
+
+        try {
+            interfacePfd = builder.establish()
+        } catch (e: Exception) {
+            Log.e("ToyVPN", "Builder establish failed", e)
+            throw e
+        }
+
+        if (interfacePfd == null) {
+             throw IllegalStateException("Could not establish VPN")
+        }
+
+        // Detach TUN FD to pass ownership to Rust
+        val tunFd = interfacePfd!!.detachFd()
+        Log.d("ToyVPN", "VPN Interface TUN FD: $tunFd")
+        interfacePfd = null
 
         val startTime = System.currentTimeMillis()
         var lastTxBytes = 0L
@@ -197,8 +215,8 @@ class ToyVpnService : VpnService() {
         }
 
         try {
-            Log.d("ToyVPN", "Starting Rust client with tunFd=$tunFd, udpFd=$udpFd")
-            vpnClient?.start(tunFd, udpFd, callback)
+            Log.d("ToyVPN", "Starting Rust client with tunFd=$tunFd")
+            vpnClient?.start(tunFd, callback)
             Log.d("ToyVPN", "Rust client started")
 
             // Keep coroutine alive until cancelled
