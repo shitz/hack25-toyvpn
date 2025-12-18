@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.VpnService
 import android.os.Bundle
+import android.util.Log
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
@@ -31,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private val statsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == ToyVpnService.ACTION_STATS_UPDATE) {
+                // Log.d("ToyVPN", "UI Received Stats Update")
                 val duration = intent.getLongExtra(ToyVpnService.EXTRA_STATS_DURATION, 0L)
                 if (duration == 0L && isConnected && intent.hasExtra(ToyVpnService.EXTRA_STATS_DURATION)) {
                      // Disconnect signal
@@ -86,8 +88,12 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        registerReceiver(statsReceiver, IntentFilter(ToyVpnService.ACTION_STATS_UPDATE),
-            Context.RECEIVER_NOT_EXPORTED)
+        val filter = IntentFilter(ToyVpnService.ACTION_STATS_UPDATE)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+             registerReceiver(statsReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+             registerReceiver(statsReceiver, filter)
+        }
     }
 
     override fun onPause() {

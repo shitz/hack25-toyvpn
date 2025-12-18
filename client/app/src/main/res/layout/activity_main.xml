@@ -29,8 +29,8 @@
                 android:id="@+id/etServerAddress"
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
-                android:text="10.0.0.1"
-                android:inputType="numberDecimal|text" />
+                android:inputType="numberDecimal|text"
+                android:text="163.172.171.48" />
         </com.google.android.material.textfield.TextInputLayout>
 
         <com.google.android.material.textfield.TextInputLayout

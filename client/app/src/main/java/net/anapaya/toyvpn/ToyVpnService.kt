@@ -14,6 +14,7 @@ import java.io.FileOutputStream
 import java.net.InetSocketAddress
 import java.nio.ByteBuffer
 import java.nio.channels.DatagramChannel
+import java.util.concurrent.atomic.AtomicLong
 
 class ToyVpnService : VpnService() {
 
@@ -21,9 +22,9 @@ class ToyVpnService : VpnService() {
     private var job: Job? = null
     private val scope = CoroutineScope(Dispatchers.IO)
 
-    // Stats
-    private var totalSentBytes = 0L
-    private var totalReceivedBytes = 0L
+    // Stats (Thread safe)
+    private var totalSentBytes = AtomicLong(0)
+    private var totalReceivedBytes = AtomicLong(0)
     private var startTime = 0L
 
     companion object {
@@ -33,7 +34,7 @@ class ToyVpnService : VpnService() {
 
         const val EXTRA_SERVER_ADDRESS = "server_address"
         const val EXTRA_SERVER_PORT = "server_port"
-        const val EXTRA_CLIENT_IP = "client_ip" // Configurable client IP
+        const val EXTRA_CLIENT_IP = "client_ip"
 
         const val EXTRA_STATS_DURATION = "stats_duration"
         const val EXTRA_STATS_TX_BYTES = "stats_tx_bytes"
@@ -49,7 +50,7 @@ class ToyVpnService : VpnService() {
             stopVpn()
             return START_NOT_STICKY
         } else if (intent?.action == ACTION_CONNECT) {
-            val serverIp = intent.getStringExtra(EXTRA_SERVER_ADDRESS) ?: "10.0.0.1"
+            val serverIp = intent.getStringExtra(EXTRA_SERVER_ADDRESS) ?: "163.172.171.48"
             val serverPort = intent.getIntExtra(EXTRA_SERVER_PORT, 12345)
             val clientIp = intent.getStringExtra(EXTRA_CLIENT_IP) ?: "10.0.0.2"
             startVpn(serverIp, serverPort, clientIp)
@@ -70,8 +71,8 @@ class ToyVpnService : VpnService() {
         startForeground(1, notification)
 
         startTime = System.currentTimeMillis()
-        totalSentBytes = 0
-        totalReceivedBytes = 0
+        totalSentBytes.set(0)
+        totalReceivedBytes.set(0)
 
         job = scope.launch {
             try {
@@ -97,8 +98,8 @@ class ToyVpnService : VpnService() {
             val now = System.currentTimeMillis()
             val duration = (now - startTime) / 1000
 
-            val currentTx = totalSentBytes
-            val currentRx = totalReceivedBytes
+            val currentTx = totalSentBytes.get()
+            val currentRx = totalReceivedBytes.get()
 
             val txRate = (currentTx - lastTx) // bytes per second
             val rxRate = (currentRx - lastRx) // bytes per second
@@ -106,7 +107,10 @@ class ToyVpnService : VpnService() {
             lastTx = currentTx
             lastRx = currentRx
 
+            Log.d("ToyVPN", "Stats: Tx=$currentTx, Rx=$currentRx, Dur=$duration")
+
             val intent = Intent(ACTION_STATS_UPDATE).apply {
+                setPackage(packageName)
                 putExtra(EXTRA_STATS_DURATION, duration)
                 putExtra(EXTRA_STATS_TX_BYTES, currentTx)
                 putExtra(EXTRA_STATS_RX_BYTES, currentRx)
@@ -126,9 +130,8 @@ class ToyVpnService : VpnService() {
             stopForeground(true)
             stopSelf()
 
-            // Send final Disconnect update
             sendBroadcast(Intent(ACTION_STATS_UPDATE).apply {
-                putExtra(EXTRA_STATS_DURATION, 0L) // Signal reset
+                putExtra(EXTRA_STATS_DURATION, 0L)
             })
 
         } catch (e: Exception) {
@@ -137,20 +140,35 @@ class ToyVpnService : VpnService() {
     }
 
     private suspend fun runVpn(serverIp: String, serverPort: Int, clientIp: String) {
+        Log.d("ToyVPN", "Starting VPN to $serverIp:$serverPort as $clientIp")
         val builder = Builder()
         builder.setSession("ToyVPN")
         builder.addAddress(clientIp, 24)
         builder.addRoute("0.0.0.0", 0)
         builder.setMtu(1500)
 
-        interfacePfd = builder.establish() ?: throw IllegalStateException("Could not establish VPN")
+        try {
+            interfacePfd = builder.establish()
+        } catch (e: Exception) {
+            Log.e("ToyVPN", "Builder establish failed", e)
+            throw e
+        }
+
+        if (interfacePfd == null) {
+             Log.e("ToyVPN", "Builder establish returned null")
+             throw IllegalStateException("Could not establish VPN")
+        }
+        Log.d("ToyVPN", "VPN Interface established: ${interfacePfd?.fileDescriptor}")
 
         val tunnel = DatagramChannel.open()
         if (!protect(tunnel.socket())) {
             throw IllegalStateException("Cannot protect the tunnel")
         }
+
+        Log.d("ToyVPN", "Connecting tunnel to $serverIp:$serverPort")
         tunnel.connect(InetSocketAddress(serverIp, serverPort))
         tunnel.configureBlocking(true)
+        Log.d("ToyVPN", "Tunnel connected")
 
         val tunInputStream = FileInputStream(interfacePfd!!.fileDescriptor)
         val tunOutputStream = FileOutputStream(interfacePfd!!.fileDescriptor)
@@ -158,18 +176,26 @@ class ToyVpnService : VpnService() {
         coroutineScope {
             // 1. Upstream: TUN -> UDP
             val upstream = launch {
+                Log.d("ToyVPN", "Upstream started")
                 val buffer = ByteBuffer.allocate(4096)
                 while (isActive) {
                     try {
+                        // FIX: Explicitly check for -1. Handle 0 by continuing.
                         val read = tunInputStream.read(buffer.array())
                         if (read > 0) {
-                             totalSentBytes += read
+                             totalSentBytes.addAndGet(read.toLong())
+                             if (totalSentBytes.get() < 50000) Log.v("ToyVPN", "Upstream: read $read bytes from TUN")
+
                             buffer.limit(read)
                             buffer.position(0)
                             tunnel.write(buffer)
                             buffer.clear()
-                        } else {
+                        } else if (read < 0) {
+                            Log.d("ToyVPN", "Upstream: EOF from TUN (read returned $read)")
                             break
+                        } else {
+                            // read == 0
+                           // Log.v("ToyVPN", "Upstream: read 0 bytes")
                         }
                     } catch (e: Exception) {
                         if (isActive) Log.e("ToyVPN", "Upstream error", e)
@@ -180,17 +206,20 @@ class ToyVpnService : VpnService() {
 
             // 2. Downstream: UDP -> TUN
             val downstream = launch {
+                Log.d("ToyVPN", "Downstream started")
                 val buffer = ByteBuffer.allocate(4096)
                 while (isActive) {
                     try {
                         val read = tunnel.read(buffer)
                         if (read > 0) {
-                            totalReceivedBytes += read
+                            totalReceivedBytes.addAndGet(read.toLong())
+                            if (totalReceivedBytes.get() < 50000) Log.v("ToyVPN", "Downstream: read $read bytes from UDP")
                             buffer.flip()
                             tunOutputStream.write(buffer.array(), 0, buffer.limit())
                             buffer.clear()
-                        } else {
-                            break
+                        } else if (read < 0) {
+                             Log.d("ToyVPN", "Downstream: EOF from UDP (read returned $read)")
+                             break
                         }
                     } catch (e: Exception) {
                          if (isActive) Log.e("ToyVPN", "Downstream error", e)
