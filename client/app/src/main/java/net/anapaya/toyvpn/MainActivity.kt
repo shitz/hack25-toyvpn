@@ -32,9 +32,12 @@ class MainActivity : AppCompatActivity() {
     private val statsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == ToyVpnService.ACTION_STATS_UPDATE) {
-                // Log.d("ToyVPN", "UI Received Stats Update")
                 val duration = intent.getLongExtra(ToyVpnService.EXTRA_STATS_DURATION, 0L)
-                if (duration == 0L && isConnected && intent.hasExtra(ToyVpnService.EXTRA_STATS_DURATION)) {
+
+                // Disconnect signal: duration=0 AND no TX/RX bytes present
+                // (Normal stats updates always include bytes, stop signal doesn't)
+                val hasBytesData = intent.hasExtra(ToyVpnService.EXTRA_STATS_TX_BYTES)
+                if (duration == 0L && isConnected && !hasBytesData) {
                      // Disconnect signal
                      isConnected = false
                      updateUI()

@@ -38,9 +38,7 @@ impl ToyVpnClient {
     pub fn start(
         &self,
         tun_fd: i32,
-        server_ip: String,
-        server_port: u16,
-        _client_ip: String,
+        udp_fd: i32,
         callback: Box<dyn VpnCallback>,
     ) -> Result<(), VpnError> {
         let stop_signal = self.stop_signal.clone();
@@ -58,7 +56,7 @@ impl ToyVpnClient {
 
             rt.block_on(async move {
                 log::info!("Rust VPN Thread started");
-                let res = client::run_vpn(tun_fd, server_ip, server_port, callback.clone(), stop_signal).await;
+                let res = client::run_vpn(tun_fd, udp_fd, callback.clone(), stop_signal).await;
                 if let Err(e) = res {
                     log::error!("VPN Loop Error: {:?}", e);
                     callback.on_stop(e.to_string());

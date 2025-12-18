@@ -1,5 +1,5 @@
 use std::os::fd::FromRawFd;
-use std::os::unix::io::AsRawFd;
+use std::net::UdpSocket as StdUdpSocket;
 use std::sync::Arc;
 use std::io::{Read, Write};
 use tokio::net::UdpSocket;
@@ -10,12 +10,11 @@ const BUFFER_SIZE: usize = 4096;
 
 pub async fn run_vpn(
     tun_fd: i32,
-    server_ip: String,
-    server_port: u16,
+    udp_fd: i32,
     callback: Arc<dyn VpnCallback>,
     stop_signal: Arc<Notify>,
 ) -> anyhow::Result<()> {
-    log::info!("run_vpn starting with fd={}, server={}:{}", tun_fd, server_ip, server_port);
+    log::info!("run_vpn starting with tun_fd={}, udp_fd={}", tun_fd, udp_fd);
 
     // 1. Create TUN file handles (we'll use two separate handles for read/write threads)
     // Safety: We own this FD from Android. We dup it so we can have separate read/write handles.
@@ -36,12 +35,13 @@ pub async fn run_vpn(
     let mut tun_reader = unsafe { std::fs::File::from_raw_fd(tun_read_fd) };
     let mut tun_writer = unsafe { std::fs::File::from_raw_fd(tun_write_fd) };
 
-    // 2. Connect UDP socket
-    let remote_addr = format!("{}:{}", server_ip, server_port);
-    let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
-    udp.connect(&remote_addr).await?;
+    // 2. Use the pre-connected, protected UDP socket from Android
+    // Safety: We own this FD from Android (it's already connected and protected)
+    let std_udp = unsafe { StdUdpSocket::from_raw_fd(udp_fd) };
+    std_udp.set_nonblocking(true)?;
+    let udp = Arc::new(UdpSocket::from_std(std_udp)?);
 
-    log::info!("UDP socket bound and connected to {}", remote_addr);
+    log::info!("Using pre-connected UDP socket from Android");
 
     // 3. Create channels for communication between threads
     // TUN Read Thread -> Main Loop: packets to send via UDP
@@ -50,8 +50,7 @@ pub async fn run_vpn(
     let (udp_tx, mut udp_rx) = mpsc::channel::<Vec<u8>>(256);
 
     // 4. Spawn TUN Read Thread (blocking read)
-    let stop_signal_tun_read = stop_signal.clone();
-    let tun_read_handle = std::thread::spawn(move || {
+    let _tun_read_handle = std::thread::spawn(move || {
         log::info!("TUN read thread started");
         let mut buf = [0u8; BUFFER_SIZE];
         loop {
@@ -61,14 +60,12 @@ pub async fn run_vpn(
                     break;
                 }
                 Ok(n) => {
-                    log::debug!("TUN read: {} bytes", n);
                     if tun_tx.blocking_send(buf[..n].to_vec()).is_err() {
                         log::info!("TUN read: channel closed");
                         break;
                     }
                 }
                 Err(e) => {
-                    // Check if we should stop
                     log::error!("TUN read error: {}", e);
                     break;
                 }
@@ -78,14 +75,13 @@ pub async fn run_vpn(
     });
 
     // 5. Spawn TUN Write Thread (blocking write)
-    let tun_write_handle = std::thread::spawn(move || {
+    let _tun_write_handle = std::thread::spawn(move || {
         log::info!("TUN write thread started");
         while let Some(packet) = udp_rx.blocking_recv() {
             if let Err(e) = tun_writer.write_all(&packet) {
                 log::error!("TUN write error: {}", e);
                 break;
             }
-            log::debug!("TUN write: {} bytes", packet.len());
         }
         log::info!("TUN write thread exiting");
     });
@@ -108,7 +104,6 @@ pub async fn run_vpn(
             }
 
             _ = stats_interval.tick() => {
-                log::debug!("Stats update: tx={}, rx={}", total_tx, total_rx);
                 callback.on_stats_update(total_tx, total_rx);
             }
 
@@ -143,10 +138,6 @@ pub async fn run_vpn(
     // Cleanup: close channels by dropping senders
     drop(tun_rx);
     drop(udp_tx);
-
-    // Wait for threads to finish (they should exit when channels close)
-    // Note: tun_read_handle may block on read() - we can't easily interrupt it
-    // The TUN fd is closed when tun_reader is dropped
 
     log::info!("VPN run_vpn completed");
     Ok(())

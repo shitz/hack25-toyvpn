@@ -15,6 +15,6 @@ enum VpnError {
 interface ToyVpnClient {
     constructor();
     [Throws=VpnError]
-    void start(i32 tun_fd, string server_ip, u16 server_port, string client_ip, VpnCallback callback);
+    void start(i32 tun_fd, i32 udp_fd, VpnCallback callback);
     void stop();
 };
