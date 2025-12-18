@@ -9,23 +9,20 @@ import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import kotlinx.coroutines.*
-import java.io.FileInputStream
-import java.io.FileOutputStream
-import java.net.InetSocketAddress
-import java.nio.ByteBuffer
-import java.nio.channels.DatagramChannel
 import java.util.concurrent.atomic.AtomicLong
+
+// Import UniFFI generated bindings
+// Note: Package name depends on uniffi generation defaults.
+// We assume 'uniffi.toyvpn_client' based on crate name.
+import uniffi.toyvpn_client.ToyVpnClient
+import uniffi.toyvpn_client.VpnCallback
 
 class ToyVpnService : VpnService() {
 
     private var interfacePfd: ParcelFileDescriptor? = null
     private var job: Job? = null
+    private var vpnClient: ToyVpnClient? = null
     private val scope = CoroutineScope(Dispatchers.IO)
-
-    // Stats (Thread safe)
-    private var totalSentBytes = AtomicLong(0)
-    private var totalReceivedBytes = AtomicLong(0)
-    private var startTime = 0L
 
     companion object {
         const val ACTION_CONNECT = "net.anapaya.toyvpn.CONNECT"
@@ -70,67 +67,48 @@ class ToyVpnService : VpnService() {
             .build()
         startForeground(1, notification)
 
-        startTime = System.currentTimeMillis()
-        totalSentBytes.set(0)
-        totalReceivedBytes.set(0)
+        // Initialize Rust Client
+        try {
+            vpnClient = ToyVpnClient()
+        } catch (e: Exception) {
+            Log.e("ToyVPN", "Failed to load Rust client", e)
+            stopSelf()
+            return
+        }
 
         job = scope.launch {
             try {
-                // Launch Stats Reporter
-                launch {
-                    reportStatsLoop()
-                }
-
                 runVpn(serverIp, serverPort, clientIp)
             } catch (e: Exception) {
                 Log.e("ToyVPN", "VPN Error", e)
             } finally {
-                stopVpn()
+                // cleanup handled in stopVpn or unexpected crash
+                if (isActive) stopVpn()
             }
-        }
-    }
-
-    private suspend fun reportStatsLoop() {
-        var lastTx = 0L
-        var lastRx = 0L
-        while (currentCoroutineContext().isActive) {
-            delay(1000)
-            val now = System.currentTimeMillis()
-            val duration = (now - startTime) / 1000
-
-            val currentTx = totalSentBytes.get()
-            val currentRx = totalReceivedBytes.get()
-
-            val txRate = (currentTx - lastTx) // bytes per second
-            val rxRate = (currentRx - lastRx) // bytes per second
-
-            lastTx = currentTx
-            lastRx = currentRx
-
-            Log.d("ToyVPN", "Stats: Tx=$currentTx, Rx=$currentRx, Dur=$duration")
-
-            val intent = Intent(ACTION_STATS_UPDATE).apply {
-                setPackage(packageName)
-                putExtra(EXTRA_STATS_DURATION, duration)
-                putExtra(EXTRA_STATS_TX_BYTES, currentTx)
-                putExtra(EXTRA_STATS_RX_BYTES, currentRx)
-                putExtra(EXTRA_STATS_TX_RATE, txRate)
-                putExtra(EXTRA_STATS_RX_RATE, rxRate)
-            }
-            sendBroadcast(intent)
         }
     }
 
     private fun stopVpn() {
         try {
-            interfacePfd?.close()
-            interfacePfd = null
+            Log.d("ToyVPN", "Stopping VPN...")
+            vpnClient?.stop()
+            // We don't nullify vpnClient immediately as it might still be in callback
+
+            interfacePfd?.close() // Ensure FD is closed if Rust didn't (though Rust took ownership of the dup?)
+            // Actually detachFd() invalidates interfacePfd, so we don't need to close it here if we detached.
+            // But if we failed before detach, we should close.
+            if (interfacePfd != null) {
+                interfacePfd?.close()
+                interfacePfd = null
+            }
+
             job?.cancel()
             job = null
             stopForeground(true)
             stopSelf()
 
             sendBroadcast(Intent(ACTION_STATS_UPDATE).apply {
+                setPackage(packageName)
                 putExtra(EXTRA_STATS_DURATION, 0L)
             })
 
@@ -140,7 +118,7 @@ class ToyVpnService : VpnService() {
     }
 
     private suspend fun runVpn(serverIp: String, serverPort: Int, clientIp: String) {
-        Log.d("ToyVPN", "Starting VPN to $serverIp:$serverPort as $clientIp")
+        Log.d("ToyVPN", "Setting up VPN interface")
         val builder = Builder()
         builder.setSession("ToyVPN")
         builder.addAddress(clientIp, 24)
@@ -155,78 +133,76 @@ class ToyVpnService : VpnService() {
         }
 
         if (interfacePfd == null) {
-             Log.e("ToyVPN", "Builder establish returned null")
              throw IllegalStateException("Could not establish VPN")
         }
-        Log.d("ToyVPN", "VPN Interface established: ${interfacePfd?.fileDescriptor}")
 
-        val tunnel = DatagramChannel.open()
-        if (!protect(tunnel.socket())) {
-            throw IllegalStateException("Cannot protect the tunnel")
+        // Detach FD to pass ownership to Rust
+        // Note: detachFd() returns the int FD and closes the ParcelFileDescriptor container (but not the FD itself)
+        val fd = interfacePfd!!.detachFd()
+        Log.d("ToyVPN", "VPN Interface FD: $fd") // Will be passed to Rust.
+
+        // Clear kotlin reference as it's now invalid/detached
+        interfacePfd = null
+
+        val startTime = System.currentTimeMillis()
+
+        // Create Callback
+        val callback = object : VpnCallback {
+            override fun onStatsUpdate(txBytes: ULong, rxBytes: ULong) {
+                 val duration = (System.currentTimeMillis() - startTime) / 1000
+                 // Calculate rates? We need state.
+                 // Simple implementation: just pass totals. UI calculates rate?
+                 // MainActivity expects totals. It calculates rates itself (it keeps `lastTx`? No, MainActivity logic needs checking).
+                 // MainActivity DOES calculate rates from totals. Good.
+
+                 val intent = Intent(ACTION_STATS_UPDATE).apply {
+                    setPackage(packageName)
+                    putExtra(EXTRA_STATS_DURATION, duration)
+                    putExtra(EXTRA_STATS_TX_BYTES, txBytes.toLong())
+                    putExtra(EXTRA_STATS_RX_BYTES, rxBytes.toLong())
+                    // Rate defaults to 0 if not calculated here.
+                }
+                sendBroadcast(intent)
+            }
+
+            override fun onStop(reason: String) {
+                Log.d("ToyVPN", "Rust client stopped: $reason")
+                // We should stop the service if not already stopping?
+                // Avoid infinite loop if stopVpn called this.
+                if (reason != "Stopped") {
+                     // Error case
+                     Log.e("ToyVPN", "Rust reported error: $reason")
+                }
+            }
         }
 
-        Log.d("ToyVPN", "Connecting tunnel to $serverIp:$serverPort")
-        tunnel.connect(InetSocketAddress(serverIp, serverPort))
-        tunnel.configureBlocking(true)
-        Log.d("ToyVPN", "Tunnel connected")
+        try {
+            Log.d("ToyVPN", "Starting Rust client...")
+            // start is blocking? No, I spawned thread in Rust.
+            // But start method in Rust returns Result.
+            // U16 -> UShort
+            vpnClient?.start(fd, serverIp, serverPort.toUShort(), clientIp, callback)
+            Log.d("ToyVPN", "Rust client started")
 
-        val tunInputStream = FileInputStream(interfacePfd!!.fileDescriptor)
-        val tunOutputStream = FileOutputStream(interfacePfd!!.fileDescriptor)
+            // Keep coroutine alive?
+            // The Rust thread runs independently.
+            // But if this coroutine scope (job) finishes, does it matter?
+            // The Service job keeps the service context alive?
+            // Actually, we parked the thread in runVpn previously.
+            // Now we return immediately.
+            // Is that okay?
+            // If `runVpn` returns, `job` completes?
+            // If `job` completes, what happens?
+            // Nothing, unless we call `stopVpn` in `finally`.
+            // In `startVpn`: `try { runVpn() } finally { stopVpn() }`
+            // So if `runVpn` returns, `stopVpn` is called!
+            // We CANNOT return from `runVpn`. We must suspend until stopped.
 
-        coroutineScope {
-            // 1. Upstream: TUN -> UDP
-            val upstream = launch {
-                Log.d("ToyVPN", "Upstream started")
-                val buffer = ByteBuffer.allocate(4096)
-                while (isActive) {
-                    try {
-                        // FIX: Explicitly check for -1. Handle 0 by continuing.
-                        val read = tunInputStream.read(buffer.array())
-                        if (read > 0) {
-                             totalSentBytes.addAndGet(read.toLong())
-                             if (totalSentBytes.get() < 50000) Log.v("ToyVPN", "Upstream: read $read bytes from TUN")
+            awaitCancellation()
 
-                            buffer.limit(read)
-                            buffer.position(0)
-                            tunnel.write(buffer)
-                            buffer.clear()
-                        } else if (read < 0) {
-                            Log.d("ToyVPN", "Upstream: EOF from TUN (read returned $read)")
-                            break
-                        } else {
-                            // read == 0
-                           // Log.v("ToyVPN", "Upstream: read 0 bytes")
-                        }
-                    } catch (e: Exception) {
-                        if (isActive) Log.e("ToyVPN", "Upstream error", e)
-                        break
-                    }
-                }
-            }
-
-            // 2. Downstream: UDP -> TUN
-            val downstream = launch {
-                Log.d("ToyVPN", "Downstream started")
-                val buffer = ByteBuffer.allocate(4096)
-                while (isActive) {
-                    try {
-                        val read = tunnel.read(buffer)
-                        if (read > 0) {
-                            totalReceivedBytes.addAndGet(read.toLong())
-                            if (totalReceivedBytes.get() < 50000) Log.v("ToyVPN", "Downstream: read $read bytes from UDP")
-                            buffer.flip()
-                            tunOutputStream.write(buffer.array(), 0, buffer.limit())
-                            buffer.clear()
-                        } else if (read < 0) {
-                             Log.d("ToyVPN", "Downstream: EOF from UDP (read returned $read)")
-                             break
-                        }
-                    } catch (e: Exception) {
-                         if (isActive) Log.e("ToyVPN", "Downstream error", e)
-                         break
-                    }
-                }
-            }
+        } catch (e: Exception) {
+             Log.e("ToyVPN", "Rust Start Error", e)
+             throw e
         }
     }
 

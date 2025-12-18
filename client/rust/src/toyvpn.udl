@@ -1,0 +1,20 @@
+namespace toyvpn_client {
+
+};
+
+callback interface VpnCallback {
+    void on_stats_update(u64 tx_bytes, u64 rx_bytes);
+    void on_stop(string reason);
+};
+
+[Error]
+enum VpnError {
+    "StartFailed",
+};
+
+interface ToyVpnClient {
+    constructor();
+    [Throws=VpnError]
+    void start(i32 tun_fd, string server_ip, u16 server_port, string client_ip, VpnCallback callback);
+    void stop();
+};
