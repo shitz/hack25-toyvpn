@@ -209,6 +209,8 @@ class ToyVpnService : VpnService() {
                     putExtra(EXTRA_ROUTES, routesStr)
                 }
                 sendBroadcast(intent)
+
+                updateNotification(tx, rx, txRate, rxRate)
             }
 
             override fun onStop(reason: String) {
@@ -243,6 +245,28 @@ class ToyVpnService : VpnService() {
             val manager = getSystemService(NotificationManager::class.java)
             manager.createNotificationChannel(serviceChannel)
         }
+    }
+
+    private fun updateNotification(txBytes: Long, rxBytes: Long, txRate: Long, rxRate: Long) {
+        val notificationManager = getSystemService(NotificationManager::class.java)
+        val notification = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Connected")
+            .setContentText("↑ ${formatBytes(txRate)}/s   ↓ ${formatBytes(rxRate)}/s")
+            .setStyle(NotificationCompat.BigTextStyle()
+                .bigText("↑ ${formatBytes(txRate)}/s (Total: ${formatBytes(txBytes)})\n" +
+                        "↓ ${formatBytes(rxRate)}/s (Total: ${formatBytes(rxBytes)})"))
+            .setSmallIcon(android.R.drawable.ic_dialog_info)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .build()
+        notificationManager.notify(1, notification)
+    }
+
+    private fun formatBytes(bytes: Long): String {
+        if (bytes <= 0) return "0 B"
+        val units = arrayOf("B", "KB", "MB", "GB", "TB")
+        val digitGroups = (Math.log10(bytes.toDouble()) / Math.log10(1024.0)).toInt()
+        return String.format("%.1f %s", bytes / Math.pow(1024.0, digitGroups.toDouble()), units[digitGroups])
     }
 
     override fun onDestroy() {
