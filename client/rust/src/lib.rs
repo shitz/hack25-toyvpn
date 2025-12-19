@@ -1,7 +1,18 @@
 use std::sync::{Arc, Mutex};
-use std::os::fd::FromRawFd;
-use std::net::Ipv4Addr;
 use tokio::runtime::Runtime;
+
+use anyhow::Context;
+use edge_token::dummy_edge_app_token;
+use edge_tun::client::{ClientBuilder, Control, Incoming, Outgoing};
+use edge_tun::PSEUDO_SECURE_SERVER_SECRET;
+use quinn::crypto::rustls::QuicClientConfig;
+use quinn::EndpointConfig;
+use rustls::ClientConfig;
+use scion_proto::address::SocketAddr as ScionSocketAddr;
+use scion_stack::scionstack::ScionStackBuilder;
+use std::str::FromStr;
+use std::time::Duration;
+use url::Url;
 
 mod client;
 
@@ -12,7 +23,7 @@ pub struct Route {
     pub prefix_length: i32,
 }
 
-pub struct ClientConfig {
+pub struct VpnClientConfig {
     pub client_ip: String,
     pub routes: Vec<Route>,
 }
@@ -33,7 +44,20 @@ pub enum VpnError {
 /// The main VPN client object
 pub struct ToyVpnClient {
     stop_signal: Arc<tokio::sync::Notify>,
-    socket: Mutex<Option<std::net::UdpSocket>>,
+    runtime: Runtime,
+    connection: Mutex<Option<ToyVpnClientConnection>>,
+}
+
+pub struct ToyVpnClientConnection {
+    edge_read: Incoming,
+    edge_write: Outgoing,
+    ctrl: Control,
+}
+
+impl Default for ToyVpnClient {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToyVpnClient {
@@ -43,95 +67,101 @@ impl ToyVpnClient {
                 .with_max_level(log::LevelFilter::Debug)
                 .with_tag("ToyVpnRust"),
         );
+
         Self {
             stop_signal: Arc::new(tokio::sync::Notify::new()),
-            socket: Mutex::new(None),
+            runtime: tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("Failed to create Tokio runtime"),
+            connection: Mutex::new(None),
         }
     }
 
-    pub fn handshake(&self, udp_fd: i32) -> Result<ClientConfig, VpnError> {
-        let socket = unsafe { std::net::UdpSocket::from_raw_fd(udp_fd) };
+    pub fn handshake(
+        &self,
+        snap_token: String,
+        endhost_api: String,
+        edgetun_server: String,
+    ) -> Result<VpnClientConfig, VpnError> {
+        log::info!("Starting handshake");
 
-        // Send Handshake Request: [0x00, 0x01]
-        let req = [0x00, 0x01];
-        socket.send(&req).map_err(|e| VpnError::StartFailed(format!("Send failed: {}", e)))?;
+        let edgetun_server = ScionSocketAddr::from_str(&edgetun_server).unwrap();
+        let endhost_api = Url::from_str(&endhost_api).unwrap();
 
-        // Receive Response
-        let mut buf = [0u8; 1024];
-        // Set timeout for handshake
-        socket.set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .map_err(|e| VpnError::StartFailed(format!("Set timeout failed: {}", e)))?;
+        let (edge_read, edge_write, ctrl) = self
+            .runtime
+            .block_on(async {
+                let quic_conn = establish_quic_conn(endhost_api, snap_token, edgetun_server)
+                    .await
+                    .context("Failed to establish QUIC connection to snap")?;
 
-        let (n, _) = socket.recv_from(&mut buf)
-            .map_err(|e| VpnError::StartFailed(format!("Recv failed: {}", e)))?;
+                let (edge_read, edge_write, ctrl) = ClientBuilder::default()
+                    .with_initial_mtu(1280)
+                    .with_initial_auth_token(dummy_edge_app_token())
+                    .connect(quic_conn)
+                    .await
+                    .expect("Failed to establish edgetun client connection");
 
-        // Parse Response: [0x00, 0x02, IP(4), RouteCount(1), Route1(8)...]
-        if n < 7 || buf[0] != 0x00 || buf[1] != 0x02 {
-             return Err(VpnError::StartFailed("Invalid handshake response".into()));
-        }
+                log::info!("edgetun client connection established");
+                log::info!("Advertised routes: {:?}", ctrl.advertised_routes());
 
-        let ip = Ipv4Addr::new(buf[2], buf[3], buf[4], buf[5]);
-        let route_count = buf[6] as usize;
+                anyhow::Ok((edge_read, edge_write, ctrl))
+            })
+            .map_err(|e| VpnError::StartFailed(e.to_string()))?;
+
+        let ip = ctrl
+            .assigned_addresses().first()
+            .cloned()
+            .ok_or(VpnError::StartFailed(
+                "No assigned address from edgetun server".into(),
+            ))?;
 
         let mut routes = Vec::new();
-        let mut offset = 7;
 
-        for _ in 0..route_count {
-            if offset + 8 > n {
-                break;
-            }
-            let r_ip = Ipv4Addr::new(buf[offset], buf[offset+1], buf[offset+2], buf[offset+3]);
-            let r_mask = Ipv4Addr::new(buf[offset+4], buf[offset+5], buf[offset+6], buf[offset+7]);
-            offset += 8;
-
-            // Convert mask to prefix length
-            let mask_u32: u32 = r_mask.into();
-            let prefix_len = mask_u32.count_ones() as i32;
-
+        for route in ctrl.advertised_routes() {
             routes.push(Route {
-                destination: r_ip.to_string(),
-                prefix_length: prefix_len,
+                destination: route.network().to_string(),
+                prefix_length: route.prefix_len() as i32,
             });
         }
 
-        // Store socket for start()
-        // Reset timeout
-        socket.set_read_timeout(None).ok();
-        *self.socket.lock().unwrap() = Some(socket);
+        self.connection
+            .lock()
+            .unwrap()
+            .replace(ToyVpnClientConnection {
+                edge_read,
+                edge_write,
+                ctrl,
+            });
 
-        Ok(ClientConfig {
+        Ok(VpnClientConfig {
             client_ip: ip.to_string(),
             routes,
         })
     }
 
-    pub fn start(
-        &self,
-        tun_fd: i32,
-        callback: Box<dyn VpnCallback>,
-    ) -> Result<(), VpnError> {
+    pub fn start(&self, tun_fd: i32, callback: Box<dyn VpnCallback>) -> Result<(), VpnError> {
         let stop_signal = self.stop_signal.clone();
         let callback: Arc<dyn VpnCallback> = Arc::from(callback);
 
-        // Take the socket
-        let socket = self.socket.lock().unwrap().take()
-            .ok_or(VpnError::StartFailed("Handshake not performed".into()))?;
+        // Take the connection
+        let connection = self
+            .connection
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or(VpnError::StartFailed(
+                "VPN connection not established. Call handshake() first.".into(),
+            ))?;
 
+        let rt = self.runtime.handle().clone();
         std::thread::spawn(move || {
-            let rt = match Runtime::new() {
-                Ok(rt) => rt,
-                Err(e) => {
-                    log::error!("Failed to create Runtime: {}", e);
-                    callback.on_stop(e.to_string());
-                    return;
-                }
-            };
-
             rt.block_on(async move {
                 log::info!("Rust VPN Thread started");
-                let res = client::run_vpn(tun_fd, socket, callback.clone(), stop_signal).await;
+                let res = client::run_vpn(tun_fd, connection, callback.clone(), stop_signal).await;
                 if let Err(e) = res {
-                    log::error!("VPN Loop Error: {:?}", e);
+                    log::error!("VPN Loop Error: {e:?}");
                     callback.on_stop(e.to_string());
                 } else {
                     log::info!("VPN Loop finished cleanly");
@@ -147,6 +177,55 @@ impl ToyVpnClient {
         log::info!("Stop signal received");
         self.stop_signal.notify_one();
     }
+}
+
+/// Establishes a QUIC connection to the edge app server via the given SNAP.
+async fn establish_quic_conn(
+    endhost_api_addr: url::Url,
+    auth_token: String,
+    server_addr: ScionSocketAddr,
+) -> anyhow::Result<quinn::Connection> {
+    let scion_stack = ScionStackBuilder::new(endhost_api_addr)
+        .with_auth_token(auth_token)
+        .build()
+        .await
+        .context("Failed to create SCION stack")?;
+
+    let (cert_der, _server_config) = scion_sdk_utils::test::generate_cert(
+        PSEUDO_SECURE_SERVER_SECRET,
+        vec!["localhost".into()],
+        vec![b"edgetun".to_vec()],
+    );
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(cert_der).unwrap();
+
+    let mut client_crypto = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    client_crypto.alpn_protocols = vec![b"edgetun".to_vec()];
+
+    let mut transport_config = quinn::TransportConfig::default();
+    // 5 secs == 1/6 default idle time
+    transport_config.keep_alive_interval(Some(Duration::from_secs(5)));
+    let mut client_config =
+        quinn::ClientConfig::new(Arc::new(QuicClientConfig::try_from(client_crypto).unwrap()));
+    client_config.transport_config(Arc::new(transport_config));
+    let mut endpoint = scion_stack
+        .quic_endpoint(None, EndpointConfig::default(), None, None)
+        .await
+        .unwrap();
+
+    endpoint.set_default_client_config(client_config);
+
+    log::info!("created quic endpoint, connecting to edge app server");
+
+    let conn = endpoint
+        .connect(server_addr, "localhost")
+        .context("Failed to initialize connection to edge app server")?
+        .await
+        .context("Failed to establish connection to edge app server")?;
+
+    Ok(conn)
 }
 
 // ----- Include UniFFI scaffolding AFTER defining the types -----

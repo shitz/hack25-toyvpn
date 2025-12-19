@@ -51,19 +51,24 @@ class ToyVpnService : VpnService() {
             val serverIp = intent.getStringExtra(EXTRA_SERVER_ADDRESS) ?: "163.172.171.48"
             val serverPort = intent.getIntExtra(EXTRA_SERVER_PORT, 12345)
             val clientIp = intent.getStringExtra(EXTRA_CLIENT_IP) ?: "10.0.0.2"
-            startVpn(serverIp, serverPort, clientIp)
+
+            val snapToken = "<InsertSnoken>";
+            val endhostApi = "http://193.29.10.5:5001";
+            val edgetunHost ="[64-2:0:a7,10.0.0.2]:9000";
+
+            startVpn(snapToken, endhostApi, edgetunHost)
             return START_STICKY
         }
         return START_NOT_STICKY
     }
 
-    private fun startVpn(serverIp: String, serverPort: Int, clientIp: String) {
+    private fun startVpn(snapToken: String, endhostApi: String, edgetunHost: String) {
         if (job != null) return
 
         createNotificationChannel()
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("ToyVPN")
-            .setContentText("Connecting to $serverIp")
+            .setContentText("Connecting to $edgetunHost")
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .build()
         startForeground(1, notification)
@@ -79,7 +84,7 @@ class ToyVpnService : VpnService() {
 
         job = scope.launch {
             try {
-                runVpn(serverIp, serverPort, clientIp)
+                runVpn(snapToken, endhostApi, edgetunHost)
             } catch (e: Exception) {
                 Log.e("ToyVPN", "VPN Error", e)
             } finally {
@@ -111,32 +116,10 @@ class ToyVpnService : VpnService() {
         }
     }
 
-    private suspend fun runVpn(serverIp: String, serverPort: Int, clientIp: String) {
-        // 1. Create and PROTECT the UDP socket BEFORE connecting
-        // Use DatagramChannel which allows us to get the FD via ParcelFileDescriptor
-        Log.d("ToyVPN", "Creating and protecting UDP socket...")
-        val channel = DatagramChannel.open()
-        val socket = channel.socket()
-
-        if (!protect(socket)) {
-            Log.e("ToyVPN", "Failed to protect UDP socket!")
-            throw IllegalStateException("Failed to protect UDP socket")
-        }
-        Log.d("ToyVPN", "UDP socket protected successfully")
-
-        // Connect the channel to the server
-        channel.connect(InetSocketAddress(serverIp, serverPort))
-        Log.d("ToyVPN", "UDP socket connected to $serverIp:$serverPort")
-
-        // Get the socket's FD using ParcelFileDescriptor
-        val udpPfd = ParcelFileDescriptor.fromDatagramSocket(socket)
-        val udpFd = udpPfd.detachFd()  // Detach to pass ownership to Rust
-        Log.d("ToyVPN", "UDP socket FD: $udpFd")
-
-        // 2. Handshake
+    private suspend fun runVpn(snapToken: String, endhostApi: String, edgetunHost: String) {
         Log.d("ToyVPN", "Performing handshake...")
         val config = try {
-            vpnClient?.handshake(udpFd)
+            vpnClient?.handshake(snapToken, endhostApi, edgetunHost)
         } catch (e: Exception) {
             Log.e("ToyVPN", "Handshake failed", e)
             throw e
@@ -152,6 +135,7 @@ class ToyVpnService : VpnService() {
         val builder = Builder()
         builder.setSession("ToyVPN")
         builder.addAddress(config.clientIp, 24)
+        builder.addDisallowedApplication(packageName)
 
         for (route in config.routes) {
              builder.addRoute(route.destination, route.prefixLength)

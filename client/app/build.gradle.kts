@@ -55,7 +55,7 @@ dependencies {
 }
 
 // Find the absolute path to the cargo executable
-val cargoPath = System.getenv("HOME") + "/.cargo/bin/cargo"
+val cargoPath = "cargo"
 
 tasks.register<Exec>("cargoBuild") {
     workingDir = file("../rust")

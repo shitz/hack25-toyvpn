@@ -1,22 +1,21 @@
-use std::os::fd::FromRawFd;
-use std::net::UdpSocket as StdUdpSocket;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::{ToyVpnClientConnection, VpnCallback};
+use bytes::Bytes;
 use std::io::{Read, Write};
-use tokio::net::UdpSocket;
-use tokio::sync::Notify;
+use std::os::fd::FromRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::unix::AsyncFd;
-use crate::VpnCallback;
+use tokio::sync::Notify;
 
 const BUFFER_SIZE: usize = 4096;
 
 pub async fn run_vpn(
     tun_fd: i32,
-    std_udp: StdUdpSocket,
+    edgetun: ToyVpnClientConnection,
     callback: Arc<dyn VpnCallback>,
     stop_signal: Arc<Notify>,
 ) -> anyhow::Result<()> {
-    log::info!("run_vpn starting with tun_fd={}", tun_fd);
+    log::info!("run_vpn starting with tun_fd={tun_fd}");
 
     // 1. Prepare TUN device
     // Set to non-blocking mode for AsyncFd
@@ -27,22 +26,20 @@ pub async fn run_vpn(
     let tun_file = unsafe { std::fs::File::from_raw_fd(tun_fd) };
     let tun = Arc::new(AsyncFd::new(tun_file)?);
 
-    // 2. Prepare UDP socket
-    // Use the pre-connected, protected UDP socket from Android
-    std_udp.set_nonblocking(true)?;
-    let udp = Arc::new(UdpSocket::from_std(std_udp)?);
-
-    log::info!("Using pre-connected UDP socket from Android");
-
     // 3. Stats
     let total_tx = Arc::new(AtomicU64::new(0));
     let total_rx = Arc::new(AtomicU64::new(0));
 
     // 4. Spawn Tasks
 
+    let ToyVpnClientConnection {
+        mut edge_read,
+        mut edge_write,
+        ctrl: _ctrl,
+    } = edgetun;
+
     // Task: TUN -> UDP (Uplink)
     let tun_reader = tun.clone();
-    let udp_sender = udp.clone();
     let tx_stats = total_tx.clone();
     let stop_tx = stop_signal.clone();
 
@@ -62,19 +59,19 @@ pub async fn run_vpn(
                                         break;
                                     }
                                     tx_stats.fetch_add(n as u64, Ordering::Relaxed);
-                                    if let Err(e) = udp_sender.send(&buf[..n]).await {
-                                        log::error!("UDP send error: {}", e);
+                                    if let Err(e) = edge_write.send_wait(Bytes::copy_from_slice(&buf[..n])).await {
+                                        log::error!("UDP send error: {e}");
                                     }
                                 }
                                 Ok(Err(e)) => {
-                                    log::error!("TUN read error: {}", e);
+                                    log::error!("TUN read error: {e}");
                                     break;
                                 }
                                 Err(_would_block) => continue,
                             }
                         }
                         Err(e) => {
-                            log::error!("TUN readable error: {}", e);
+                            log::error!("TUN readable error: {e}");
                             break;
                         }
                     }
@@ -86,35 +83,34 @@ pub async fn run_vpn(
 
     // Task: UDP -> TUN (Downlink)
     let tun_writer = tun.clone();
-    let udp_receiver = udp.clone();
     let rx_stats = total_rx.clone();
     let stop_rx = stop_signal.clone();
 
     let rx_task = tokio::spawn(async move {
         log::info!("Rx task started");
-        let mut buf = [0u8; BUFFER_SIZE];
         loop {
             tokio::select! {
                 _ = stop_rx.notified() => break,
-                res = udp_receiver.recv(&mut buf) => {
+                res = edge_read.receive() => {
                     match res {
-                        Ok(n) => {
-                            rx_stats.fetch_add(n as u64, Ordering::Relaxed);
+                        Ok(buf) => {
+                            rx_stats.fetch_add(buf.len() as u64, Ordering::Relaxed);
+
                             // Write to TUN
                             // We loop until we can write or error
                             loop {
                                 let mut guard = match tun_writer.writable().await {
                                     Ok(g) => g,
                                     Err(e) => {
-                                        log::error!("TUN writable error: {}", e);
+                                        log::error!("TUN writable error: {e}");
                                         return;
                                     }
                                 };
 
-                                match guard.try_io(|inner| inner.get_ref().write(&buf[..n])) {
+                                match guard.try_io(|inner| inner.get_ref().write(&buf)) {
                                     Ok(Ok(_)) => break,
                                     Ok(Err(e)) => {
-                                        log::error!("TUN write error: {}", e);
+                                        log::error!("TUN write error: {e}");
                                         return;
                                     }
                                     Err(_would_block) => continue,
@@ -122,7 +118,7 @@ pub async fn run_vpn(
                             }
                         }
                         Err(e) => {
-                            log::error!("UDP recv error: {}", e);
+                            log::error!("UDP recv error: {e}");
                             break;
                         }
                     }
@@ -187,6 +183,6 @@ fn set_nonblocking(fd: i32) -> anyhow::Result<()> {
             anyhow::bail!("fcntl F_SETFL failed to set nonblocking");
         }
     }
-    log::info!("Set fd {} to non-blocking mode", fd);
+    log::info!("Set fd {fd} to non-blocking mode");
     Ok(())
 }
