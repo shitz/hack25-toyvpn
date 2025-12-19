@@ -15,6 +15,21 @@ android_logger = "0.13"
 anyhow = "1.0"
 thiserror = "1.0"
 libc = "0.2"
+scion-stack = { path = "/Users/shitz/code/anapaya/scion/endhost/public/scion-stack" }
+scion-proto = { path = "/Users/shitz/code/anapaya/scion/endhost/public/scion-proto/scion-proto" }
+edge-tun = { path = "/Users/shitz/code/anapaya/scion/endhost/anapaya/products/edge-app/edge-tun" }
+edge-token = { path = "/Users/shitz/code/anapaya/scion/endhost/anapaya/products/edge-app/edge-token" }
+scion-sdk-utils = { path = "/Users/shitz/code/anapaya/scion/endhost/public/libs/utils" }
+url = "2.5.7"
+quinn = { version = "0.11.9-ana.0", package = "anapaya-quinn" }
+rustls = { version = "0.23", features = [
+  "ring",
+  "std",
+  "brotli",
+], default-features = false }
+tun-rs = "2.7.5"
+bytes = "1.11.0"
+
 
 [build-dependencies]
 uniffi = { version = "0.28", features = ["build"] }

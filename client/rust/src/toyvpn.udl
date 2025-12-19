@@ -7,7 +7,7 @@ dictionary Route {
     i32 prefix_length;
 };
 
-dictionary ClientConfig {
+dictionary VpnClientConfig {
     string client_ip;
     sequence<Route> routes;
 };
@@ -25,7 +25,7 @@ enum VpnError {
 interface ToyVpnClient {
     constructor();
     [Throws=VpnError]
-    ClientConfig handshake(i32 udp_fd);
+    VpnClientConfig handshake(string snap_token, string endhost_api, string edgetun_host);
     [Throws=VpnError]
     void start(i32 tun_fd, VpnCallback callback);
     void stop();
