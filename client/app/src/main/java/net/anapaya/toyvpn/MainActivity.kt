@@ -1,5 +1,6 @@
 package net.anapaya.toyvpn
 
+import android.Manifest
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -8,6 +9,8 @@ import android.content.pm.PackageManager
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
+import android.text.Editable
+import android.text.TextWatcher
 import android.view.View
 import android.widget.Button
 import android.widget.TextView
@@ -16,17 +19,29 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.google.android.material.textfield.TextInputEditText
-import android.Manifest
 
 class MainActivity : AppCompatActivity() {
 
+    private lateinit var layoutLogin: View
     private lateinit var layoutSetup: View
     private lateinit var layoutConnected: View
+    private lateinit var layoutSplash: View
+
+    private lateinit var etSnapToken: TextInputEditText
+    private lateinit var btnLogin: Button
 
     private lateinit var etServerAddressFull: TextInputEditText
     private lateinit var etSnapAddress: TextInputEditText
     private lateinit var btnConnect: Button
+    private lateinit var btnLogout: Button
     private lateinit var btnDisconnect: Button
+
+    private lateinit var cardError: View
+    private lateinit var tvErrorMessage: TextView
+    private lateinit var btnCloseError: View
+
+    private lateinit var cardConnecting: View
+    private lateinit var tvConnectingStatus: TextView
 
     private lateinit var tvConnectedServer: TextView
     private lateinit var tvDuration: TextView
@@ -36,6 +51,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvRoutes: TextView
 
     private var isConnected = false
+    private var isConnecting = false
     private val VPN_REQUEST_CODE = 0x0F
 
     private val requestPermissionLauncher = registerForActivityResult(
@@ -48,35 +64,58 @@ class MainActivity : AppCompatActivity() {
 
     private val statsReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
-            if (intent?.action == ToyVpnService.ACTION_STATS_UPDATE) {
-                val duration = intent.getLongExtra(ToyVpnService.EXTRA_STATS_DURATION, 0L)
-
-                // Disconnect signal: duration=0 AND no TX/RX bytes present
-                val hasBytesData = intent.hasExtra(ToyVpnService.EXTRA_STATS_TX_BYTES)
-                if (duration == 0L && isConnected && !hasBytesData) {
-                     // Disconnect signal
-                     isConnected = false
-                     updateUI()
-                     return
+            when (intent?.action) {
+                ToyVpnService.ACTION_VPN_ESTABLISHED -> {
+                    isConnecting = false
+                    isConnected = true
+                    updateUI()
                 }
-
-                val txBytes = intent.getLongExtra(ToyVpnService.EXTRA_STATS_TX_BYTES, 0L)
-                val rxBytes = intent.getLongExtra(ToyVpnService.EXTRA_STATS_RX_BYTES, 0L)
-                val txRate = intent.getLongExtra(ToyVpnService.EXTRA_STATS_TX_RATE, 0L)
-                val rxRate = intent.getLongExtra(ToyVpnService.EXTRA_STATS_RX_RATE, 0L)
-
-                val assignedIp = intent.getStringExtra(ToyVpnService.EXTRA_ASSIGNED_IP)
-                val routes = intent.getStringExtra(ToyVpnService.EXTRA_ROUTES)
-
-                tvDuration.text = formatDuration(duration)
-                tvSpeed.text = "↓ ${formatBytes(rxRate)}/s   ↑ ${formatBytes(txRate)}/s"
-                tvVolume.text = "↓ ${formatBytes(rxBytes)}   ↑ ${formatBytes(txBytes)}"
-
-                if (assignedIp != null) {
-                    tvAssignedIp.text = assignedIp
+                ToyVpnService.ACTION_VPN_FAILED -> {
+                    isConnecting = false
+                    isConnected = false
+                    val errorMsg = intent.getStringExtra(ToyVpnService.EXTRA_ERROR_MESSAGE) ?: "Connection failed"
+                    tvErrorMessage.text = errorMsg
+                    cardError.visibility = View.VISIBLE
+                    updateUI()
                 }
-                if (routes != null) {
-                    tvRoutes.text = routes
+                ToyVpnService.ACTION_STATS_UPDATE -> {
+                    val duration = intent.getLongExtra(ToyVpnService.EXTRA_STATS_DURATION, 0L)
+
+                    // Disconnect signal: duration=0 AND no TX/RX bytes present
+                    val hasBytesData = intent.hasExtra(ToyVpnService.EXTRA_STATS_TX_BYTES)
+                    if (duration == 0L && !hasBytesData) {
+                         // Disconnect signal
+                         isConnected = false
+                         isConnecting = false
+                         updateUI()
+                         return
+                    }
+
+                    // If we receive valid stats, we are connected
+                    if (!isConnected) {
+                        isConnected = true
+                        isConnecting = false
+                        updateUI()
+                    }
+
+                    val txBytes = intent.getLongExtra(ToyVpnService.EXTRA_STATS_TX_BYTES, 0L)
+                    val rxBytes = intent.getLongExtra(ToyVpnService.EXTRA_STATS_RX_BYTES, 0L)
+                    val txRate = intent.getLongExtra(ToyVpnService.EXTRA_STATS_TX_RATE, 0L)
+                    val rxRate = intent.getLongExtra(ToyVpnService.EXTRA_STATS_RX_RATE, 0L)
+
+                    val assignedIp = intent.getStringExtra(ToyVpnService.EXTRA_ASSIGNED_IP)
+                    val routes = intent.getStringExtra(ToyVpnService.EXTRA_ROUTES)
+
+                    tvDuration.text = formatDuration(duration)
+                    tvSpeed.text = "↓ ${formatBytes(rxRate)}/s   ↑ ${formatBytes(txRate)}/s"
+                    tvVolume.text = "↓ ${formatBytes(rxBytes)}   ↑ ${formatBytes(txBytes)}"
+
+                    if (assignedIp != null) {
+                        tvAssignedIp.text = assignedIp
+                    }
+                    if (routes != null) {
+                        tvRoutes.text = routes
+                    }
                 }
             }
         }
@@ -86,13 +125,26 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        layoutLogin = findViewById(R.id.layoutLogin)
         layoutSetup = findViewById(R.id.layoutSetup)
         layoutConnected = findViewById(R.id.layoutConnected)
+        layoutSplash = findViewById(R.id.layoutSplash)
+
+        etSnapToken = findViewById(R.id.etSnapToken)
+        btnLogin = findViewById(R.id.btnLogin)
 
         etServerAddressFull = findViewById(R.id.etServerAddressFull)
         etSnapAddress = findViewById(R.id.etSnapAddress)
         btnConnect = findViewById(R.id.btnConnect)
+        btnLogout = findViewById(R.id.btnLogout)
         btnDisconnect = findViewById(R.id.btnDisconnect)
+
+        cardError = findViewById(R.id.cardError)
+        tvErrorMessage = findViewById(R.id.tvErrorMessage)
+        btnCloseError = findViewById(R.id.btnCloseError)
+
+        cardConnecting = findViewById(R.id.cardConnecting)
+        tvConnectingStatus = findViewById(R.id.tvConnectingStatus)
 
         tvConnectedServer = findViewById(R.id.tvConnectedServer)
         tvDuration = findViewById(R.id.tvDuration)
@@ -102,6 +154,49 @@ class MainActivity : AppCompatActivity() {
         tvRoutes = findViewById(R.id.tvRoutes)
 
         askNotificationPermission()
+
+        // Initialize login button state
+        btnLogin.isEnabled = false
+        btnLogin.backgroundTintList = ContextCompat.getColorStateList(this, android.R.color.darker_gray)
+
+        etSnapToken.addTextChangedListener(object : TextWatcher {
+            override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
+            override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+            override fun afterTextChanged(s: Editable?) {
+                val token = s.toString()
+                if (token.length >= 10) {
+                    btnLogin.isEnabled = true
+                    btnLogin.backgroundTintList = ContextCompat.getColorStateList(this@MainActivity, android.R.color.holo_blue_light)
+                } else {
+                    btnLogin.isEnabled = false
+                    btnLogin.backgroundTintList = ContextCompat.getColorStateList(this@MainActivity, android.R.color.darker_gray)
+                }
+            }
+        })
+
+        btnLogin.setOnClickListener {
+            val token = etSnapToken.text.toString()
+            if (token.isNotBlank()) {
+                getSharedPreferences("toyvpn_prefs", Context.MODE_PRIVATE)
+                    .edit()
+                    .putString("snap_token", token)
+                    .apply()
+                updateUI()
+            }
+        }
+
+        btnLogout.setOnClickListener {
+            getSharedPreferences("toyvpn_prefs", Context.MODE_PRIVATE)
+                .edit()
+                .remove("snap_token")
+                .apply()
+            etSnapToken.text?.clear()
+            updateUI()
+        }
+
+        btnCloseError.setOnClickListener {
+            cardError.visibility = View.GONE
+        }
 
         btnConnect.setOnClickListener {
             val intent = VpnService.prepare(this)
@@ -120,17 +215,30 @@ class MainActivity : AppCompatActivity() {
             updateUI()
         }
 
-        updateUI()
+        // Initially show splash
+        layoutSplash.visibility = View.VISIBLE
+        layoutLogin.visibility = View.GONE
+        layoutSetup.visibility = View.GONE
+        layoutConnected.visibility = View.GONE
     }
 
     override fun onResume() {
         super.onResume()
-        val filter = IntentFilter(ToyVpnService.ACTION_STATS_UPDATE)
+        val filter = IntentFilter().apply {
+            addAction(ToyVpnService.ACTION_STATS_UPDATE)
+            addAction(ToyVpnService.ACTION_VPN_ESTABLISHED)
+            addAction(ToyVpnService.ACTION_VPN_FAILED)
+        }
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
              registerReceiver(statsReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
         } else {
              registerReceiver(statsReceiver, filter)
         }
+
+        // Probe service status
+        startService(Intent(this, ToyVpnService::class.java).apply {
+            action = ToyVpnService.ACTION_PROBE
+        })
     }
 
     override fun onPause() {
@@ -164,17 +272,23 @@ class MainActivity : AppCompatActivity() {
             }
 
             val clientIp = "10.0.0.2"
+            val endhostApi = etSnapAddress.text.toString()
+            val edgetunHost = fullAddress
+            val prefs = getSharedPreferences("toyvpn_prefs", Context.MODE_PRIVATE)
+            val snapToken = prefs.getString("snap_token", "") ?: ""
 
             val intent = Intent(this, ToyVpnService::class.java).apply {
                 action = ToyVpnService.ACTION_CONNECT
                 putExtra(ToyVpnService.EXTRA_SERVER_ADDRESS, serverIp)
                 putExtra(ToyVpnService.EXTRA_SERVER_PORT, serverPort)
-                putExtra(ToyVpnService.EXTRA_CLIENT_IP, clientIp)
+                putExtra(ToyVpnService.EXTRA_SNAP_TOKEN, snapToken)
+                putExtra(ToyVpnService.EXTRA_ENDHOST_API, endhostApi)
+                putExtra(ToyVpnService.EXTRA_EDGETUN_HOST, edgetunHost)
             }
             startService(intent)
-            isConnected = true
-
-            tvConnectedServer.text = "Connected to $fullAddress"
+            isConnecting = true
+            cardError.visibility = View.GONE
+            tvConnectingStatus.text = "Connecting to $fullAddress..."
 
             updateUI()
         }
@@ -191,12 +305,36 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateUI() {
+        layoutSplash.visibility = View.GONE
         if (isConnected) {
+            layoutLogin.visibility = View.GONE
             layoutSetup.visibility = View.GONE
             layoutConnected.visibility = View.VISIBLE
+            tvConnectedServer.text = "Connected to ${etServerAddressFull.text}"
         } else {
-            layoutSetup.visibility = View.VISIBLE
             layoutConnected.visibility = View.GONE
+            val prefs = getSharedPreferences("toyvpn_prefs", Context.MODE_PRIVATE)
+            if (prefs.contains("snap_token")) {
+                layoutLogin.visibility = View.GONE
+                layoutSetup.visibility = View.VISIBLE
+
+                if (isConnecting) {
+                    cardConnecting.visibility = View.VISIBLE
+                    btnConnect.isEnabled = false
+                    btnConnect.text = "Connecting..."
+                    etServerAddressFull.isEnabled = false
+                    etSnapAddress.isEnabled = false
+                } else {
+                    cardConnecting.visibility = View.GONE
+                    btnConnect.isEnabled = true
+                    btnConnect.text = "Connect"
+                    etServerAddressFull.isEnabled = true
+                    etSnapAddress.isEnabled = true
+                }
+            } else {
+                layoutLogin.visibility = View.VISIBLE
+                layoutSetup.visibility = View.GONE
+            }
         }
     }
 
