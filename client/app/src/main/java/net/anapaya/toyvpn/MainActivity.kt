@@ -6,10 +6,8 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.net.VpnService
 import android.os.Bundle
-import android.util.Log
 import android.view.View
 import android.widget.Button
-import android.widget.LinearLayout
 import android.widget.TextView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
@@ -17,14 +15,20 @@ import com.google.android.material.textfield.TextInputEditText
 
 class MainActivity : AppCompatActivity() {
 
-    private lateinit var etServerAddress: TextInputEditText
-    private lateinit var etServerPort: TextInputEditText
-    private lateinit var etClientIp: TextInputEditText
+    private lateinit var layoutSetup: View
+    private lateinit var layoutConnected: View
+
+    private lateinit var etServerAddressFull: TextInputEditText
+    private lateinit var etSnapAddress: TextInputEditText
     private lateinit var btnConnect: Button
-    private lateinit var layoutStats: LinearLayout
+    private lateinit var btnDisconnect: Button
+
+    private lateinit var tvConnectedServer: TextView
     private lateinit var tvDuration: TextView
-    private lateinit var tvTx: TextView
-    private lateinit var tvRx: TextView
+    private lateinit var tvSpeed: TextView
+    private lateinit var tvVolume: TextView
+    private lateinit var tvAssignedIp: TextView
+    private lateinit var tvRoutes: TextView
 
     private var isConnected = false
     private val VPN_REQUEST_CODE = 0x0F
@@ -35,7 +39,6 @@ class MainActivity : AppCompatActivity() {
                 val duration = intent.getLongExtra(ToyVpnService.EXTRA_STATS_DURATION, 0L)
 
                 // Disconnect signal: duration=0 AND no TX/RX bytes present
-                // (Normal stats updates always include bytes, stop signal doesn't)
                 val hasBytesData = intent.hasExtra(ToyVpnService.EXTRA_STATS_TX_BYTES)
                 if (duration == 0L && isConnected && !hasBytesData) {
                      // Disconnect signal
@@ -49,9 +52,19 @@ class MainActivity : AppCompatActivity() {
                 val txRate = intent.getLongExtra(ToyVpnService.EXTRA_STATS_TX_RATE, 0L)
                 val rxRate = intent.getLongExtra(ToyVpnService.EXTRA_STATS_RX_RATE, 0L)
 
-                tvDuration.text = "Duration: ${formatDuration(duration)}"
-                tvTx.text = "Sent: ${formatBytes(txBytes)} (${formatBytes(txRate)}/s)"
-                tvRx.text = "Recv: ${formatBytes(rxBytes)} (${formatBytes(rxRate)}/s)"
+                val assignedIp = intent.getStringExtra(ToyVpnService.EXTRA_ASSIGNED_IP)
+                val routes = intent.getStringExtra(ToyVpnService.EXTRA_ROUTES)
+
+                tvDuration.text = formatDuration(duration)
+                tvSpeed.text = "↓ ${formatBytes(rxRate)}/s   ↑ ${formatBytes(txRate)}/s"
+                tvVolume.text = "↓ ${formatBytes(rxBytes)}   ↑ ${formatBytes(txBytes)}"
+
+                if (assignedIp != null) {
+                    tvAssignedIp.text = assignedIp
+                }
+                if (routes != null) {
+                    tvRoutes.text = routes
+                }
             }
         }
     }
@@ -60,33 +73,39 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        etServerAddress = findViewById(R.id.etServerAddress)
-        etServerPort = findViewById(R.id.etServerPort)
-        etClientIp = findViewById(R.id.etClientIp)
+        layoutSetup = findViewById(R.id.layoutSetup)
+        layoutConnected = findViewById(R.id.layoutConnected)
+
+        etServerAddressFull = findViewById(R.id.etServerAddressFull)
+        etSnapAddress = findViewById(R.id.etSnapAddress)
         btnConnect = findViewById(R.id.btnConnect)
-        layoutStats = findViewById(R.id.layoutStats)
+        btnDisconnect = findViewById(R.id.btnDisconnect)
+
+        tvConnectedServer = findViewById(R.id.tvConnectedServer)
         tvDuration = findViewById(R.id.tvDuration)
-        tvTx = findViewById(R.id.tvTx)
-        tvRx = findViewById(R.id.tvRx)
+        tvSpeed = findViewById(R.id.tvSpeed)
+        tvVolume = findViewById(R.id.tvVolume)
+        tvAssignedIp = findViewById(R.id.tvAssignedIp)
+        tvRoutes = findViewById(R.id.tvRoutes)
 
         btnConnect.setOnClickListener {
-            if (!isConnected) {
-                // Connect
-                val intent = VpnService.prepare(this)
-                if (intent != null) {
-                    startActivityForResult(intent, VPN_REQUEST_CODE)
-                } else {
-                    onActivityResult(VPN_REQUEST_CODE, RESULT_OK, null)
-                }
+            val intent = VpnService.prepare(this)
+            if (intent != null) {
+                startActivityForResult(intent, VPN_REQUEST_CODE)
             } else {
-                // Disconnect
-                startService(Intent(this, ToyVpnService::class.java).apply {
-                    action = ToyVpnService.ACTION_DISCONNECT
-                })
-                isConnected = false
-                updateUI()
+                onActivityResult(VPN_REQUEST_CODE, RESULT_OK, null)
             }
         }
+
+        btnDisconnect.setOnClickListener {
+            startService(Intent(this, ToyVpnService::class.java).apply {
+                action = ToyVpnService.ACTION_DISCONNECT
+            })
+            isConnected = false
+            updateUI()
+        }
+
+        updateUI()
     }
 
     override fun onResume() {
@@ -107,16 +126,29 @@ class MainActivity : AppCompatActivity() {
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode == VPN_REQUEST_CODE && resultCode == RESULT_OK) {
-            val serverIp = etServerAddress.text.toString()
-            val serverPortStr = etServerPort.text.toString()
-            val clientIp = etClientIp.text.toString()
+            val fullAddress = etServerAddressFull.text.toString()
 
-            if (serverIp.isBlank() || serverPortStr.isBlank() || clientIp.isBlank()) {
-                Toast.makeText(this, "Please check all fields", Toast.LENGTH_SHORT).show()
+            if (fullAddress.isBlank()) {
+                Toast.makeText(this, "Please enter server address", Toast.LENGTH_SHORT).show()
                 return
             }
 
-            val serverPort = serverPortStr.toIntOrNull() ?: 12345
+            val lastColonIndex = fullAddress.lastIndexOf(':')
+            if (lastColonIndex == -1) {
+                Toast.makeText(this, "Invalid format. Use IP:Port", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val serverIp = fullAddress.substring(0, lastColonIndex)
+            val serverPortStr = fullAddress.substring(lastColonIndex + 1)
+            val serverPort = serverPortStr.toIntOrNull()
+
+            if (serverPort == null) {
+                Toast.makeText(this, "Invalid port", Toast.LENGTH_SHORT).show()
+                return
+            }
+
+            val clientIp = "10.0.0.2"
 
             val intent = Intent(this, ToyVpnService::class.java).apply {
                 action = ToyVpnService.ACTION_CONNECT
@@ -126,23 +158,20 @@ class MainActivity : AppCompatActivity() {
             }
             startService(intent)
             isConnected = true
+
+            tvConnectedServer.text = "Connected to $fullAddress"
+
             updateUI()
         }
     }
 
     private fun updateUI() {
         if (isConnected) {
-            btnConnect.text = getString(R.string.disconnect)
-            etServerAddress.isEnabled = false
-            etServerPort.isEnabled = false
-            etClientIp.isEnabled = false
-            layoutStats.visibility = View.VISIBLE
+            layoutSetup.visibility = View.GONE
+            layoutConnected.visibility = View.VISIBLE
         } else {
-            btnConnect.text = getString(R.string.connect)
-            etServerAddress.isEnabled = true
-            etServerPort.isEnabled = true
-            etClientIp.isEnabled = true
-            layoutStats.visibility = View.GONE
+            layoutSetup.visibility = View.VISIBLE
+            layoutConnected.visibility = View.GONE
         }
     }
 

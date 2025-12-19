@@ -37,6 +37,8 @@ class ToyVpnService : VpnService() {
         const val EXTRA_STATS_RX_BYTES = "stats_rx_bytes"
         const val EXTRA_STATS_TX_RATE = "stats_tx_rate"
         const val EXTRA_STATS_RX_RATE = "stats_rx_rate"
+        const val EXTRA_ASSIGNED_IP = "assigned_ip"
+        const val EXTRA_ROUTES = "routes"
 
         private const val CHANNEL_ID = "ToyVpnChannel"
     }
@@ -202,6 +204,9 @@ class ToyVpnService : VpnService() {
                     putExtra(EXTRA_STATS_RX_BYTES, rx)
                     putExtra(EXTRA_STATS_TX_RATE, txRate)
                     putExtra(EXTRA_STATS_RX_RATE, rxRate)
+                    putExtra(EXTRA_ASSIGNED_IP, config.clientIp)
+                    val routesStr = config.routes.joinToString("\n") { "${it.destination}/${it.prefixLength}" }
+                    putExtra(EXTRA_ROUTES, routesStr)
                 }
                 sendBroadcast(intent)
             }
